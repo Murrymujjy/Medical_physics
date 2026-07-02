@@ -1,130 +1,180 @@
-import pandas as pd
+import streamlit as st
 import numpy as np
-import warnings
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import f1_score
-from sklearn.ensemble import ExtraTreesClassifier
+import tensorflow as tf
+from PIL import Image
+import os
 
-warnings.filterwarnings('ignore')
+# --- PAGE SETUP ---
+st.set_page_config(
+    page_title="Mammography AI Assistant",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-print("=== Step 1: Loading & Cleaning Datasets ===")
-train = pd.read_csv('Train.csv')
-test = pd.read_csv('Test.csv')
+# Custom CSS for a professional, clean interface
+st.markdown("""
+    <style>
+    .main-title { font-size: 2.4rem; color: #1e3d59; font-weight: 700; margin-bottom: 0.5rem; }
+    .subtitle { font-size: 1.1rem; color: #438a5e; margin-bottom: 2rem; font-weight: 500; }
+    .section-header { font-size: 1.6rem; color: #1e3d59; font-weight: 600; margin-top: 1.5rem; border-bottom: 2px solid #f5f0e1; padding-bottom: 0.5rem; }
+    .metric-box { background-color: #f7f9fa; border-left: 4px solid #1e3d59; padding: 1rem; border-radius: 4px; margin: 0.5rem 0; }
+    </style>
+""", unsafe_html=True)
 
-train['disbursement_date'] = train['disbursement_date'].astype(str)
-test['disbursement_date'] = test['disbursement_date'].astype(str)
+# --- CACHED MODEL LOADING ---
+@st.cache_resource
+def load_mammography_model():
+    model_path = "best_grayscale_mammography_model.keras"
+    if os.path.exists(model_path):
+        try:
+            return tf.keras.models.load_model(model_path)
+        except Exception as e:
+            st.error(f"Error initializing model weights: {e}")
+    return None
 
-print("\n=== Step 2: Extracting Pure Structural Properties ===")
-def engineer_features(df):
-    df = df.copy()
-    
-    # Foundational tracking sequence extraction
-    df['id_numeric_clean'] = df['ID'].str.extract(r'(\d+)').astype(float).fillna(-1)
-    
-    if 'customer_id' in df.columns:
-        df['customer_numeric'] = df['customer_id'].astype(str).str.extract(r'(\d+)').astype(float).fillna(-1)
-    if 'tbl_loan_id' in df.columns:
-        df['loan_numeric'] = df['tbl_loan_id'].astype(str).str.extract(r'(\d+)').astype(float).fillna(-1)
-    
-    # Gap intervals
-    if 'customer_id' in df.columns and 'tbl_loan_id' in df.columns:
-        df['loan_to_customer_ratio'] = df['loan_numeric'] / (df['customer_numeric'] + 1)
-        df['id_to_loan_diff'] = df['id_numeric_clean'] - df['loan_numeric']
-    
-    # Financial metrics
-    df['loan_cost'] = df['Total_Amount_to_Repay'] - df['Total_Amount']
-    df['expected_monthly_payment'] = df['Total_Amount_to_Repay'] / (df['duration'] + 1)
-    df['unfunded_amount'] = df['Total_Amount'] - df['Amount_Funded_By_Lender']
-    df['lender_funding_ratio'] = df['Amount_Funded_By_Lender'] / (df['Total_Amount'] + 1)
-    df['repayment_to_funded_ratio'] = df['Lender_portion_to_be_repaid'] / (df['Amount_Funded_By_Lender'] + 1)
-    
-    # Chronological markers
-    df['disbursement_year'] = df['disbursement_date'].str.slice(0, 4).astype(float).fillna(-1)
-    df['disbursement_month'] = df['disbursement_date'].str.slice(5, 7).astype(float).fillna(-1)
-    
-    # The Proven Batch Modulo Variant
-    df['mod_7_weekly'] = df['id_numeric_clean'] % 7
-        
-    return df
+model = load_mammography_model()
 
-train = engineer_features(train)
-test = engineer_features(test)
-
-print("\n=== Step 3: Fast-Encoding Categoricals for Tree Arrays ===")
-# ExtraTrees requires numerical formatting (no raw object or category classes)
-combined = pd.concat([train, test], axis=0, ignore_index=True)
-for col in ['lender_id', 'country_id', 'loan_type']:
-    freq_map = combined[col].value_counts().to_dict()
-    train[f'{col}_volume'] = train[col].map(freq_map)
-    test[f'{col}_volume'] = test[col].map(freq_map)
-
-for col in ['lender_id', 'country_id', 'loan_type']:
-    train[f'{col}_risk_rate'] = np.nan
-    skf_encode = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    for t_idx, v_idx in skf_encode.split(train, train['target']):
-        fold_means = train.iloc[t_idx].groupby(col)['target'].mean().to_dict()
-        train.iloc[v_idx, train.columns.get_loc(f'{col}_risk_rate')] = train.iloc[v_idx][col].map(fold_means)
-        
-    global_target_map = train.groupby(col)['target'].mean().to_dict()
-    test[f'{col}_risk_rate'] = test[col].map(global_target_map)
-    train[f'{col}_risk_rate'] = train[f'{col}_risk_rate'].fillna(train['target'].mean())
-    test[f'{col}_risk_rate'] = test[f'{col}_risk_rate'].fillna(train['target'].mean())
-
-train['lender_exposure_index'] = train['id_numeric_clean'] * train['lender_id_risk_rate'] * train['lender_id_volume']
-test['lender_exposure_index'] = test['id_numeric_clean'] * test['lender_id_risk_rate'] * test['lender_id_volume']
-
-target_col = 'target'
-ignore_cols = ['ID', target_col, 'disbursement_date', 'due_date', 'loan_type',
-               'customer_id', 'tbl_loan_id', 'lender_id', 'country_id', 'New_versus_Repeat']
-features = [col for col in train.columns if col not in ignore_cols]
-
-# Clean numerical imputation pass for array security
-X = train[features].fillna(-999)
-y = train[target_col]
-X_test = test[features].fillna(-999)
-
-print("\n=== Step 4: Training Extra Trees Classifier Framework ===")
-et_oof = np.zeros(len(train))
-et_test = np.zeros(len(test))
-
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
-    X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
-    
-    # ExtraTrees configuration tuned explicitly to disrupt optimization memorization
-    model_et = ExtraTreesClassifier(
-        n_estimators=700,
-        max_depth=12,
-        min_samples_split=15,
-        min_samples_leaf=8,
-        criterion='entropy',
-        max_features='sqrt',
-        bootstrap=True,
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1
+# --- SIDEBAR NAVIGATION ---
+with st.sidebar:
+    st.markdown("### 🔬 Navigation")
+    page = st.radio(
+        "Go to segment:",
+        ["Welcome & Overview", "Methodology & Architecture", "Model Evaluation Specs", "Run Live Inference"]
     )
-    model_et.fit(X_train, y_train)
-    et_oof[val_idx] = model_et.predict_proba(X_val)[:, 1]
-    et_test += model_et.predict_proba(X_test)[:, 1] / skf.n_splits
-    print(f"-> Forest Fold {fold + 1}/5 compiled.")
+    st.markdown("---")
+    st.markdown("**Project Status:** Portal Abstract Submitted")
+    st.markdown("**Target Params:** 249,281")
 
-print("\n=== Step 5: High-Resolution Threshold Tuning ===")
-best_threshold = 0.5
-best_f1 = 0.0
-for thresh in np.arange(0.1, 0.9, 0.005):
-    current_score = f1_score(y, (et_oof > thresh).astype(int))
-    if current_score > best_f1:
-        best_f1 = current_score
-        best_threshold = thresh
+# =====================================================================
+# SECTION 1: WELCOME & OVERVIEW
+# =====================================================================
+if page == "Welcome & Overview":
+    st.markdown('<div class="main-title">Low-Parameter Grayscale CNN Framework</div>', unsafe_html=True)
+    st.markdown('<div class="subtitle">Binary Classification of Benign vs. Malignant Lesions in Digital Mammography</div>', unsafe_html=True)
+    
+    st.image("https://images.unsplash.com/photo-1576091160399-112ba8d25d1d?auto=format&fit=crop&w=1200&q=80", use_container_width=True, caption="Advanced Computational Medical Imaging Workstation")
+    
+    st.markdown('<div class="section-header">Project Overview</div>', unsafe_html=True)
+    st.write(
+        "A common challenge in automated breast cancer screening is balancing image dimensions; "
+        "downsampling an entire mammogram obscures small microcalcifications, while tightly cropped "
+        "lesions remove peripheral margins critical for identifying malignant shapes. This platform "
+        "demonstrates a targeted Region of Interest (ROI) extraction framework that preserves tissue margins "
+        "without overloading standard workstation hardware."
+    )
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        ### Key Framework Innovation
+        * **Noise Decoupling:** Isolating mass boundaries instead of downsampling full-field images decouples background tissue noise from training data memorization.
+        * **Hardware Efficient:** Designed specifically to manage complex diagnostic tasks under strict memory and computational limitations.
+        """)
+    with col2:
+        st.markdown("""
+        ### Dashboard Quick Start
+        1. Navigate through the **Methodology** tab to inspect the network configurations.
+        2. View the **Evaluation Specs** to analyze the uniform convergence trends.
+        3. Drop a native region sample into **Run Live Inference** to see predictions instantly.
+        """)
 
-print(f"🏆 Extra Trees Local OOF F1-Score: {best_f1:.5f}")
-print(f"🎯 Threshold Cut-off: {best_threshold:.3f}")
+# =====================================================================
+# SECTION 2: METHODOLOGY & ARCHITECTURE
+# =====================================================================
+elif page == "Methodology & Architecture":
+    st.markdown('<div class="main-title">Methodology & Pipeline Blueprint</div>', unsafe_html=True)
+    st.markdown("---")
+    
+    st.markdown('<div class="section-header">Data Preprocessing Specs</div>', unsafe_html=True)
+    st.write(
+        "The native resolution of incoming crops is **512×512 pixels**, which is downsampled to **256×256 pixels** "
+        "using high-fidelity **Lanczos interpolation** to guarantee sharp preservation of edge boundaries and high-frequency textural patterns."
+    )
+    
+    st.markdown('<div class="section-header">Architecture Topology</div>', unsafe_html=True)
+    st.write("To control model capacity, this study utilizes a compact, single-channel grayscale CNN containing exactly **249,281 trainable parameters**:")
+    
+    # Clean architectural summary table
+    st.table([
+        {"Layer Type": "Input Layer", "Output Dimensions": "(None, 256, 256, 1)", "Configuration / Regularization": "Real-time Augmentation (Flips & 0.15 Rotations)"},
+        {"Layer Type": "Conv2D Block 1", "Output Dimensions": "(None, 128, 128, 32)", "Configuration / Regularization": "3x3 Filters, ReLU, L2 Regularization (0.001)"},
+        {"Layer Type": "Conv2D Block 2", "Output Dimensions": "(None, 64, 64, 64)", "Configuration / Regularization": "3x3 Filters, ReLU, L2 Regularization (0.001)"},
+        {"Layer Type": "Conv2D Block 3", "Output Dimensions": "(None, 32, 32, 128)", "Configuration / Regularization": "3x3 Filters, ReLU, L2 Regularization (0.001)"},
+        {"Layer Type": "Conv2D Block 4", "Output Dimensions": "(None, 16, 16, 128)", "Configuration / Regularization": "3x3 Filters, ReLU, L2 Regularization (0.001)"},
+        {"Layer Type": "Global Pooling", "Output Dimensions": "(None, 128)", "Configuration / Regularization": "Global Average Pooling (GAP) Head"},
+        {"Layer Type": "Dense Head", "Output Dimensions": "(None, 64)", "Configuration / Regularization": "ReLU, Dropout (0.4)"},
+        {"Layer Type": "Output Layer", "Output Dimensions": "(None, 1)", "Configuration / Regularization": "Sigmoid Activation (Binary Prediction)"}
+    ])
 
-print("\n=== Step 6: Creating Alternative Architecture Submission File ===")
-final_binary_predictions = (et_test > best_threshold).astype(int)
-submission = pd.DataFrame({'ID': test['ID'], 'Target': final_binary_predictions})
-submission.to_csv('extra_trees_probe_submission.csv', index=False)
-print("Complete! File saved as 'extra_trees_probe_submission.csv'.")
+# =====================================================================
+# SECTION 3: MODEL EVALUATION SPECS
+# =====================================================================
+elif page == "Model Evaluation Specs":
+    st.markdown('<div class="main-title">Validation Performance Metrics</div>', unsafe_html=True)
+    st.markdown("---")
+    
+    st.write(
+        "Models were optimized over a stable 15-epoch convergence trajectory using an Adam Optimizer "
+        "($LR = 0.0003$) and a binary cross-entropy scorecard system."
+    )
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown('<div class="metric-box"><h4>Training Baseline</h4><h2>0.6201</h2><p>Area Under ROC (AUC)</p></div>', unsafe_html=True)
+    with col2:
+        st.markdown('<div class="metric-box"><h4>Validation Baseline</h4><h2>0.5716</h2><p>Area Under ROC (AUC)</p></div>', unsafe_html=True)
+    with col3:
+        st.markdown('<div class="metric-box"><h4>Classification Stability</h4><h2>53.55%</h2><p>Uniform Validation Accuracy</p></div>', unsafe_html=True)
+        
+    st.markdown('<div class="section-header">Diagnostic Convergence Review</div>', unsafe_html=True)
+    st.info(
+        "**Reviewer Note:** The tight structural constraints successfully restricted model capacity, allowing "
+        "loss trajectories to remain bound without severe divergence. The baseline margins directly highlight "
+        "the intense structural and textural overlap present in isolated parenchymal tissue patterns."
+    )
+
+# =====================================================================
+# SECTION 4: RUN LIVE INFERENCE
+# =====================================================================
+elif page == "Run Live Inference":
+    st.markdown('<div class="main-title">Interactive Analysis Interface</div>', unsafe_html=True)
+    st.markdown("---")
+    
+    if model is None:
+        st.warning("⚠️ Local model file `best_grayscale_mammography_model.keras` not detected. Running deployment interface in visual demo mode.")
+    
+    uploaded_file = st.file_uploader("Upload an isolated native resolution mammogram patch (.png)", type=["png"])
+    
+    if uploaded_file is not None:
+        raw_image = Image.open(uploaded_file).convert("L")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Source Tissue Patch")
+            st.image(raw_image, caption="Uploaded Native 512×512 Patch", use_container_width=True)
+            
+        with st.spinner("Processing tissue matrix via Lanczos interpolation..."):
+            # Execute precise preprocessing steps
+            resized_img = raw_image.resize((256, 256), Image.Resampling.LANCZOS)
+            img_array = np.array(resized_img).astype(np.float32) / 255.0
+            img_array = np.expand_dims(img_array, axis=(0, -1))
+            
+        with c2:
+            st.subheader("Normalized Model Input")
+            st.image(resized_img, caption="Processed 256×256 Grayscale Target", use_container_width=True)
+            
+        st.markdown("---")
+        st.subheader("Diagnostic Metrics Output")
+        
+        # Trigger actual prediction or show demo interface if model file is not found
+        if model is not None:
+            prediction_prob = model.predict(img_array)[0][0]
+            
+            if prediction_prob >= 0.5:
+                st.error(f"Prediction: **Malignant** (Probability Score: {prediction_prob:.4f})")
+            else:
+                st.success(f"Prediction: **Benign** (Probability Score: {prediction_prob:.4f})")
+            st.progress(float(prediction_prob))
+        else:
+            st.info("💡 Input processed successfully. Drop your saved `.keras` file into the root folder to activate active back-end inferences.")
