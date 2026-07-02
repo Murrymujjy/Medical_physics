@@ -20,7 +20,7 @@ st.markdown("""
     .section-header { font-size: 1.6rem; color: #1e3d59; font-weight: 600; margin-top: 1.5rem; border-bottom: 2px solid #f5f0e1; padding-bottom: 0.5rem; }
     .metric-box { background-color: #f7f9fa; border-left: 4px solid #1e3d59; padding: 1rem; border-radius: 4px; margin: 0.5rem 0; }
     </style>
-""", unsafe_html=True)
+""", unsafe_allow_html=True)
 
 # --- CACHED MODEL LOADING ---
 @st.cache_resource
